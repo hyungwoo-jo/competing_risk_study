@@ -33,7 +33,8 @@ generate_educational_data <- function(n = 300,
                                     beta_age = 0.5, 
                                     beta_sex = -0.3, 
                                     beta_score = 0.2,
-                                    tie_probability = 0.3,  # tie 발생 확률
+                                    apply_ties = FALSE,
+                                    tie_precision = 1.0,  # 의학 데이터: 일 단위 측정
                                     censoring_rate = 0.15) {
   # 공변량 생성 (표준화)
   age <- scale(rnorm(n, 65, 12))[,1]        # 나이 (표준화)
@@ -56,12 +57,9 @@ generate_educational_data <- function(n = 300,
   status <- ifelse(time_primary <= pmin(time_competing, cens_time), 1,
                    ifelse(time_competing <= pmin(time_primary, cens_time), 2, 0))
   
-  # Tie 인위적 생성 (교육 목적)
-  tie_indices <- sample(1:n, round(n * tie_probability))
-  if(length(tie_indices) > 1) {
-    # 일부 관측치들을 같은 시간으로 설정
-    tie_time <- median(obs_time[tie_indices])
-    obs_time[tie_indices] <- tie_time
+  # 의학 데이터 스타일 tie 생성 (ceiling 방식)
+  if (apply_ties) {
+    obs_time <- ceiling(obs_time / tie_precision) * tie_precision
   }
   
   data.frame(
@@ -78,11 +76,47 @@ generate_educational_data <- function(n = 300,
 # True Value 계산 함수 (대용량 데이터셋 기반)
 # =============================================================================
 
+# =============================================================================
+# True Value 캐싱 시스템
+# =============================================================================
+
+save_true_values <- function(true_values_list, filename = "cached_true_values.rds") {
+  saveRDS(true_values_list, file = filename)
+  cat("✅ True values가 캐시에 저장되었습니다:", filename, "\n")
+}
+
+load_true_values <- function(filename = "cached_true_values.rds") {
+  if(file.exists(filename)) {
+    true_values_list <- readRDS(filename)
+    cat("📂 캐시된 True values를 불러왔습니다:", filename, "\n")
+    return(true_values_list)
+  }
+  return(NULL)
+}
+
 get_true_values <- function(beta_age = 0.5, 
                            beta_sex = -0.3, 
                            beta_score = 0.2,
                            large_n = 50000,
-                           tie_method = "efron") {
+                           tie_method = "efron",
+                           force_recalculate = FALSE) {
+  
+  # 캐시 파일명 생성 (파라미터 기반)
+  cache_filename <- sprintf("true_values_n%d_age%.1f_sex%.1f_score%.1f.rds", 
+                           large_n, beta_age, beta_sex, beta_score)
+  
+  # 캐시 확인 및 로드
+  if (!force_recalculate) {
+    cached_values <- load_true_values(cache_filename)
+    if (!is.null(cached_values)) {
+      cat("📊 캐시된 True Values:\n")
+      for(i in 1:length(cached_values$values)) {
+        cat(sprintf("   %s: %.6f\n", names(cached_values$values)[i], cached_values$values[i]))
+      }
+      cat("\n")
+      return(cached_values)
+    }
+  }
   
   cat("🎯 True Values 계산 중...\n")
   cat(sprintf("   - 대용량 데이터셋 크기: %d\n", large_n))
@@ -95,7 +129,7 @@ get_true_values <- function(beta_age = 0.5,
     beta_age = beta_age,
     beta_sex = beta_sex, 
     beta_score = beta_score,
-    tie_probability = 0,  # tie 없음
+    apply_ties = FALSE,  # tie 없음
     censoring_rate = 0.1  # 낮은 검열률
   )
   
@@ -125,11 +159,22 @@ get_true_values <- function(beta_age = 0.5,
   }
   cat("\n")
   
-  return(list(
+  true_values_list <- list(
     values = true_values,
     large_data = large_data,
-    crr_fit = crr_fit
-  ))
+    crr_fit = crr_fit,
+    parameters = list(
+      beta_age = beta_age,
+      beta_sex = beta_sex,
+      beta_score = beta_score,
+      large_n = large_n
+    )
+  )
+  
+  # 캐시에 저장
+  save_true_values(true_values_list, cache_filename)
+  
+  return(true_values_list)
 }
 
 # =============================================================================
@@ -376,7 +421,7 @@ educational_interpretation <- function(comparison_data) {
 # 5. 시뮬레이션 실행 함수 (병렬 처리 + True Value 기반)
 # =============================================================================
 
-sample_from_large_data <- function(large_data, sample_size = 300) {
+sample_from_large_data <- function(large_data, sample_size = 300, apply_ties = FALSE, tie_precision = 1.0) {
   # 대용량 데이터에서 샘플링
   sample_indices <- sample(1:nrow(large_data), sample_size, replace = FALSE)
   sampled_data <- large_data[sample_indices, ]
@@ -384,24 +429,37 @@ sample_from_large_data <- function(large_data, sample_size = 300) {
   # ID 재배정
   sampled_data$id <- 1:nrow(sampled_data)
   
+  # 의학 데이터 스타일 tie 생성 (옵션)
+  if (apply_ties) {
+    sampled_data$time <- ceiling(sampled_data$time / tie_precision) * tie_precision
+  }
+  
   return(sampled_data)
 }
 
 run_educational_simulation <- function(true_values_list, 
                                      n_sim = 50, 
                                      sample_size = 300,
+                                     apply_ties = FALSE,
+                                     tie_precision = 1.0,
                                      tie_method = "efron") {
   
   cat("🔬 교육용 시뮬레이션 시작\n")
   cat(sprintf("   - 시뮬레이션 횟수: %d\n", n_sim))
   cat(sprintf("   - 샘플 크기: %d\n", sample_size))
   cat(sprintf("   - 사용할 코어: %d개\n", n_cores))
+  cat(sprintf("   - Tie 적용: %s\n", ifelse(apply_ties, sprintf("Yes (precision=%.1f)", tie_precision), "No")))
   cat("   - True value 기반 샘플링 방식\n\n")
   
   # 병렬 처리를 위한 함수
   simulate_single <- function(i) {
-    # 대용량 데이터에서 샘플링
-    sampled_data <- sample_from_large_data(true_values_list$large_data, sample_size)
+    # 대용량 데이터에서 샘플링 (tie 옵션 포함)
+    sampled_data <- sample_from_large_data(
+      true_values_list$large_data, 
+      sample_size, 
+      apply_ties = apply_ties, 
+      tie_precision = tie_precision
+    )
     
     # 모델 적합
     results <- fit_educational_models(sampled_data, tie_method = tie_method)
@@ -417,6 +475,8 @@ run_educational_simulation <- function(true_values_list,
         coef = method_result$coef,
         se = method_result$se,
         bias = method_result$coef - true_values_list$values[names(method_result$coef)],
+        ties_applied = apply_ties,
+        tie_precision = tie_precision,
         stringsAsFactors = FALSE
       )
     }
@@ -526,13 +586,15 @@ main_educational_analysis <- function(beta_age = 0.5,
                                     large_n = 50000,
                                     sample_size = 300,
                                     n_sim = 100,
+                                    apply_ties = FALSE,
+                                    tie_precision = 1.0,
                                     tie_method = "efron") {
   
   cat("🎓 개선된 Competing Risks 교육용 분석\n")
   cat("=" %+% paste(rep("=", 60), collapse="") %+% "\n\n")
   
-  # STEP 1: True Value 계산
-  cat("📊 STEP 1: True Values 계산\n")
+  # STEP 1: True Value 계산 (캐시 활용)
+  cat("📊 STEP 1: True Values 계산 (캐시 시스템)\n")
   cat("-" %+% paste(rep("-", 40), collapse="") %+% "\n")
   
   true_values_list <- get_true_values(
@@ -548,7 +610,12 @@ main_educational_analysis <- function(beta_age = 0.5,
   cat("-" %+% paste(rep("-", 40), collapse="") %+% "\n")
   
   # 대용량 데이터에서 샘플링
-  sample_data <- sample_from_large_data(true_values_list$large_data, sample_size)
+  sample_data <- sample_from_large_data(
+    true_values_list$large_data, 
+    sample_size, 
+    apply_ties = apply_ties,
+    tie_precision = tie_precision
+  )
   
   cat(sprintf("샘플 데이터 요약:\n"))
   cat(sprintf("  - 샘플 크기: %d\n", nrow(sample_data)))
@@ -558,11 +625,13 @@ main_educational_analysis <- function(beta_age = 0.5,
               sum(sample_data$status == 2), mean(sample_data$status == 2) * 100))
   cat(sprintf("  - 검열: %d (%.1f%%)\n", 
               sum(sample_data$status == 0), mean(sample_data$status == 0) * 100))
+  cat(sprintf("  - Tie 적용: %s\n", ifelse(apply_ties, sprintf("Yes (precision=%.1f)", tie_precision), "No")))
   
   # Tie 정보
   tie_times <- table(sample_data$time)
   n_ties <- sum(tie_times > 1)
-  cat(sprintf("  - Tie가 있는 시점: %d개\n\n", n_ties))
+  max_tie_count <- ifelse(n_ties > 0, max(tie_times), 0)
+  cat(sprintf("  - Tie가 있는 시점: %d개 (최대 동시 %d명)\n\n", n_ties, max_tie_count))
   
   # 모델 적합
   results <- fit_educational_models(sample_data, tie_method = tie_method)
@@ -581,6 +650,8 @@ main_educational_analysis <- function(beta_age = 0.5,
     true_values_list = true_values_list,
     n_sim = n_sim,
     sample_size = sample_size,
+    apply_ties = apply_ties,
+    tie_precision = tie_precision,
     tie_method = tie_method
   )
   
@@ -599,8 +670,152 @@ main_educational_analysis <- function(beta_age = 0.5,
     single_results = results,
     single_comparison = comparison,
     sim_results = sim_results,
-    sim_analysis = sim_analysis
+    sim_analysis = sim_analysis,
+    settings = list(
+      apply_ties = apply_ties,
+      tie_precision = tie_precision,
+      tie_method = tie_method
+    )
   ))
+}
+
+# =============================================================================
+# 종합 비교 분석 함수 (Tie 있음 vs 없음)
+# =============================================================================
+
+comprehensive_tie_comparison <- function(beta_age = 0.5, 
+                                       beta_sex = -0.3, 
+                                       beta_score = 0.2,
+                                       large_n = 30000,
+                                       sample_size = 400,
+                                       n_sim = 200,
+                                       tie_precision = 1.0,
+                                       tie_method = "efron") {
+  
+  cat("🔬 종합 Tie 비교 분석\n")
+  cat("=" %+% paste(rep("=", 60), collapse="") %+% "\n\n")
+  
+  # True values 한 번만 계산
+  true_values_list <- get_true_values(
+    beta_age = beta_age,
+    beta_sex = beta_sex, 
+    beta_score = beta_score,
+    large_n = large_n
+  )
+  
+  # 분석 1: Tie 없음
+  cat("📊 분석 1: Tie 없는 연속시간 데이터\n")
+  cat("-" %+% paste(rep("-", 50), collapse="") %+% "\n")
+  
+  results_no_ties <- main_educational_analysis(
+    beta_age = beta_age,
+    beta_sex = beta_sex,
+    beta_score = beta_score,
+    large_n = large_n,
+    sample_size = sample_size,
+    n_sim = n_sim,
+    apply_ties = FALSE,
+    tie_method = tie_method
+  )
+  
+  cat("\n\n" %+% paste(rep("=", 80), collapse="") %+% "\n\n")
+  
+  # 분석 2: Tie 있음
+  cat("📊 분석 2: 의학 데이터 스타일 Tie 적용\n")
+  cat("-" %+% paste(rep("-", 50), collapse="") %+% "\n")
+  
+  results_with_ties <- main_educational_analysis(
+    beta_age = beta_age,
+    beta_sex = beta_sex,
+    beta_score = beta_score,
+    large_n = large_n,
+    sample_size = sample_size,
+    n_sim = n_sim,
+    apply_ties = TRUE,
+    tie_precision = tie_precision,
+    tie_method = tie_method
+  )
+  
+  # 종합 비교
+  cat("\n\n" %+% paste(rep("=", 80), collapse="") %+% "\n")
+  cat("🏆 최종 종합 비교: Tie의 영향 분석\n")
+  cat(paste(rep("=", 80), collapse="") %+% "\n\n")
+  
+  compare_tie_effects(results_no_ties, results_with_ties, true_values_list$values)
+  
+  return(list(
+    true_values = true_values_list,
+    no_ties = results_no_ties,
+    with_ties = results_with_ties
+  ))
+}
+
+compare_tie_effects <- function(results_no_ties, results_with_ties, true_values) {
+  
+  cat("📈 Tie 효과 상세 분석\n\n")
+  
+  # SE 비교 (AGE 계수 기준)
+  no_ties_se <- results_no_ties$sim_analysis %>% 
+    filter(parameter == "age") %>% 
+    select(method, mean_se, coverage, rmse)
+  
+  with_ties_se <- results_with_ties$sim_analysis %>% 
+    filter(parameter == "age") %>% 
+    select(method, mean_se, coverage, rmse)
+  
+  comparison_table <- data.frame(
+    Method = no_ties_se$method,
+    SE_NoTies = no_ties_se$mean_se,
+    SE_WithTies = with_ties_se$mean_se,
+    SE_Ratio = with_ties_se$mean_se / no_ties_se$mean_se,
+    Coverage_NoTies = no_ties_se$coverage,
+    Coverage_WithTies = with_ties_se$coverage,
+    RMSE_NoTies = no_ties_se$rmse,
+    RMSE_WithTies = with_ties_se$rmse
+  )
+  
+  cat("🎯 AGE 계수 성능 비교:\n")
+  print(kable(comparison_table, digits = 4))
+  
+  cat("\n💡 주요 발견사항:\n")
+  
+  # SE 변화 분석
+  se_changes <- (comparison_table$SE_WithTies - comparison_table$SE_NoTies) / comparison_table$SE_NoTies * 100
+  
+  for(i in 1:nrow(comparison_table)) {
+    method <- comparison_table$Method[i]
+    change <- se_changes[i]
+    direction <- ifelse(change > 0, "증가", "감소")
+    
+    cat(sprintf("  - %s: SE %.1f%% %s\n", method, abs(change), direction))
+  }
+  
+  # Robust SE 현상 확인
+  cat("\n🔍 Robust SE 현상 분석:\n")
+  
+  crr_se_no_ties <- comparison_table$SE_NoTies[comparison_table$Method == "cmprsk::crr"]
+  robust_se_no_ties <- comparison_table$SE_NoTies[grepl("Robust", comparison_table$Method)]
+  
+  crr_se_with_ties <- comparison_table$SE_WithTies[comparison_table$Method == "cmprsk::crr"]
+  robust_se_with_ties <- comparison_table$SE_WithTies[grepl("Robust", comparison_table$Method)]
+  
+  cat(sprintf("  - Tie 없음: Robust SE vs CRR = %.4f vs %.4f\n", 
+              min(robust_se_no_ties), crr_se_no_ties))
+  cat(sprintf("  - Tie 있음: Robust SE vs CRR = %.4f vs %.4f\n", 
+              min(robust_se_with_ties), crr_se_with_ties))
+  
+  robust_phenomenon_no_ties <- min(robust_se_no_ties) < crr_se_no_ties
+  robust_phenomenon_with_ties <- min(robust_se_with_ties) < crr_se_with_ties
+  
+  cat(sprintf("  - Robust SE 축소 현상: Tie 없음=%s, Tie 있음=%s\n", 
+              ifelse(robust_phenomenon_no_ties, "Yes", "No"),
+              ifelse(robust_phenomenon_with_ties, "Yes", "No")))
+  
+  cat("\n🎓 교육적 결론:\n")
+  cat("  ✅ Tie 처리 방식이 SE에 미치는 영향 정량화\n")
+  cat("  ✅ 각 방법별 Tie 민감도 확인\n")  
+  cat("  ✅ Robust SE 현상의 조건 의존성 확인\n")
+  cat("  ✅ 실무에서의 방법 선택 가이드라인 제공\n\n")
 }
 
 # =============================================================================
@@ -743,18 +958,79 @@ final_educational_summary <- function(sim_analysis, true_values) {
 }
 
 # =============================================================================
-# 실행
+# 실행 옵션들
 # =============================================================================
 
-# 메인 분석 실행 (개선된 버전)
-cat("🚀 교육용 Competing Risks 분석 시작\n\n")
+# 옵션 1: 기본 분석 (Tie 없음 - 이전 결과)
+run_basic_analysis <- function() {
+  cat("🚀 기본 교육용 Competing Risks 분석 (Tie 없음)\n\n")
+  
+  educational_results <- main_educational_analysis(
+    beta_age = 0.5,
+    beta_sex = -0.3, 
+    beta_score = 0.2,
+    large_n = 30000,    # 캐시된 true values 사용
+    sample_size = 400,  
+    n_sim = 200,        
+    apply_ties = FALSE,  # Tie 없음
+    tie_method = "efron"
+  )
+  
+  return(educational_results)
+}
 
-educational_results <- main_educational_analysis(
-  beta_age = 0.5,
-  beta_sex = -0.3, 
-  beta_score = 0.2,
-  large_n = 30000,    # 대용량 데이터 크기 (원래대로)
-  sample_size = 400,  # 샘플 크기
-  n_sim = 200,        # 시뮬레이션 횟수 (원래대로)
-  tie_method = "efron"
-)
+# 옵션 2: Tie 있는 분석
+run_tie_analysis <- function() {
+  cat("🚀 Tie 적용 교육용 Competing Risks 분석\n\n")
+  
+  educational_results <- main_educational_analysis(
+    beta_age = 0.5,
+    beta_sex = -0.3, 
+    beta_score = 0.2,
+    large_n = 30000,    # 캐시된 true values 사용
+    sample_size = 400,  
+    n_sim = 200,        
+    apply_ties = TRUE,   # 의학 데이터 스타일 tie
+    tie_precision = 1.0, # 일 단위
+    tie_method = "efron"
+  )
+  
+  return(educational_results)
+}
+
+# 옵션 3: 종합 비교 (Tie 있음 vs 없음)
+run_comprehensive_comparison <- function() {
+  cat("🚀 종합 Tie 비교 분석 시작\n\n")
+  
+  comprehensive_results <- comprehensive_tie_comparison(
+    beta_age = 0.5,
+    beta_sex = -0.3, 
+    beta_score = 0.2,
+    large_n = 30000,    # 캐시된 true values 사용
+    sample_size = 400,  
+    n_sim = 200,        
+    tie_precision = 1.0, # 일 단위 측정
+    tie_method = "efron"
+  )
+  
+  return(comprehensive_results)
+}
+
+# =============================================================================
+# 실행 - 사용자가 선택할 수 있도록 함수로 제공
+# =============================================================================
+
+cat("📋 사용 가능한 분석 옵션:\n")
+cat("  1. run_basic_analysis()      - 기본 분석 (Tie 없음)\n")
+cat("  2. run_tie_analysis()        - Tie 적용 분석\n") 
+cat("  3. run_comprehensive_comparison() - 종합 비교 (권장)\n\n")
+
+cat("💡 예시 실행:\n")
+cat("  > results <- run_comprehensive_comparison()\n")
+cat("  > results <- run_tie_analysis()\n\n")
+
+# 자동 실행 (종합 비교 - 가장 교육적)
+cat("🔄 자동 실행: 종합 비교 분석\n")
+cat("=" %+% paste(rep("=", 50), collapse="") %+% "\n")
+
+# comprehensive_results <- run_comprehensive_comparison()
